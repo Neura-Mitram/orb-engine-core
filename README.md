@@ -1,6 +1,6 @@
-# orb-engine-core
+# 🧠 orb-engine-core
 
-🧠 Neura-Mitram Core Backend Engine
+Neura-Mitram Core Backend Engine
 
 This repository houses the lightweight, high-performance, serverless backend engine for Neura-Mitram (Your Neural Friend). 
 
