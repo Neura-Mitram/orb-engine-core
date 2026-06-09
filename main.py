@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import firestore
 
 app = FastAPI(title="Neura-Mitram Core Engine")
 
@@ -20,11 +20,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Database
+# Initialize Database NATIVELY (No JSON key file needed in Cloud Run)
 try:
-    cred = credentials.Certificate("firebase-key.json")
-    firebase_admin.initialize_app(cred)
+    firebase_admin.initialize_app()
     db = firestore.client()
+    print("Firestore connected natively.")
 except Exception as e:
     print(f"Firebase failed to initialize: {e}")
 
@@ -40,7 +40,7 @@ class FeedRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "Neura-Mitram Secured"}
+    return {"status": "online", "service": "Neura-Mitram Secured Natively"}
 
 @app.post("/feed-mitram")
 async def feed_mitram(request: FeedRequest):
@@ -76,27 +76,30 @@ async def feed_mitram(request: FeedRequest):
         ai_data = json.loads(response.text)
         
         # Log to Firestore
-        user_ref = db.collection("users").document(request.user_id)
-        user_doc = user_ref.get()
-        flag_history = []
-        if user_doc.exists:
-            existing_data = user_doc.to_dict()
-            flag_history = existing_data.get("recent_distress_flags", [])
-            
-        if ai_data["distress_flag"] != "none":
-            flag_history.append(ai_data["distress_flag"])
-            if len(flag_history) > 5:
-                flag_history.pop(0)
+        try:
+            user_ref = db.collection("users").document(request.user_id)
+            user_doc = user_ref.get()
+            flag_history = []
+            if user_doc.exists:
+                existing_data = user_doc.to_dict()
+                flag_history = existing_data.get("recent_distress_flags", [])
+                
+            if ai_data["distress_flag"] != "none":
+                flag_history.append(ai_data["distress_flag"])
+                if len(flag_history) > 5:
+                    flag_history.pop(0)
 
-        user_ref.set({
-            "user_id": request.user_id,
-            "mitram_state": {
-                "current_color": ai_data["orb_color"],
-                "core_vibe": ai_data["snappy_reaction"],
-                "last_fed_timestamp": datetime.utcnow().isoformat() + "Z"
-            },
-            "recent_distress_flags": flag_history
-        }, merge=True)
+            user_ref.set({
+                "user_id": request.user_id,
+                "mitram_state": {
+                    "current_color": ai_data["orb_color"],
+                    "core_vibe": ai_data["snappy_reaction"],
+                    "last_fed_timestamp": datetime.utcnow().isoformat() + "Z"
+                },
+                "recent_distress_flags": flag_history
+            }, merge=True)
+        except Exception as db_err:
+            print(f"Firestore logging error (non-fatal): {db_err}")
 
         return ai_data
 
