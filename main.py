@@ -86,11 +86,12 @@ async def feed_mitram(request: FeedRequest):
 
     # Dispatch Request to OpenRouter API
     try:
+        # Increased timeout to 30s because free models can sometimes be slow to wake up
         response = requests.post(
             url="https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             data=json.dumps(payload),
-            timeout=10
+            timeout=30
         )
         
         if response.status_code != 200:
