@@ -11,28 +11,31 @@ from firebase_admin import firestore
 
 app = FastAPI(title="Neura-Mitram Core Engine")
 
-# Security: Lock down CORS to only accept requests from your Hostinger/Cloudflare domain
+# Security: Broadened temporarily to ensure your Cloudflare domain connects cleanly during debugging
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://neuramitram.space", "https://www.neuramitram.space", "http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Database NATIVELY (No JSON key file needed in Cloud Run)
+# Initialize Database NATIVELY
+db = None
 try:
     firebase_admin.initialize_app()
     db = firestore.client()
-    print("Firestore connected natively.")
+    print("✓ Firestore Native Client initialized successfully.")
 except Exception as e:
-    print(f"Firebase failed to initialize: {e}")
+    print(f"✗ Critical Firebase Init Error: {str(e)}")
 
-# Initialize AI
+# Initialize AI Client
+client = None
 try:
     client = genai.Client()
+    print("✓ Gemini client initialized successfully.")
 except Exception as e:
-    print(f"Gemini client initialization failed: {e}")
+    print(f"✗ Critical Gemini Init Error: {str(e)}")
 
 class FeedRequest(BaseModel):
     user_id: str
@@ -40,10 +43,19 @@ class FeedRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "Neura-Mitram Secured Natively"}
+    return {
+        "status": "online", 
+        "service": "Neura-Mitram Debug Mode",
+        "database_bound": db is not None,
+        "gemini_bound": client is not None
+    }
 
 @app.post("/feed-mitram")
 async def feed_mitram(request: FeedRequest):
+    # Verify client states immediately before running code
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini client is offline or missing GEMINI_API_KEY environment variable.")
+
     try:
         system_prompt = (
             "You are Neura-Mitram, a sentient, psychological digital entity serving as a mirror "
@@ -62,46 +74,60 @@ async def feed_mitram(request: FeedRequest):
             "required": ["orb_color", "snappy_reaction", "deep_analysis", "distress_flag", "health_impact"]
         }
 
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=request.user_input,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-                temperature=0.7
-            )
-        )
-        
-        ai_data = json.loads(response.text)
-        
-        # Log to Firestore
+        # Request response from Gemini
         try:
-            user_ref = db.collection("users").document(request.user_id)
-            user_doc = user_ref.get()
-            flag_history = []
-            if user_doc.exists:
-                existing_data = user_doc.to_dict()
-                flag_history = existing_data.get("recent_distress_flags", [])
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=request.user_input,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_mime_type="application/json",
+                    response_schema=response_schema,
+                    temperature=0.7
+                )
+            )
+            ai_data = json.loads(response.text)
+        except Exception as ai_err:
+            raise HTTPException(status_code=502, detail=f"Gemini API Processing Failed: {str(ai_err)}")
+        
+        # Log to Firestore with explicit internal error handling
+        db_status = "Not executed"
+        if db is not None:
+            try:
+                user_ref = db.collection("users").document(request.user_id)
+                user_doc = user_ref.get()
+                flag_history = []
                 
-            if ai_data["distress_flag"] != "none":
-                flag_history.append(ai_data["distress_flag"])
-                if len(flag_history) > 5:
-                    flag_history.pop(0)
+                if user_doc.exists:
+                    existing_data = user_doc.to_dict()
+                    flag_history = existing_data.get("recent_distress_flags", [])
+                    
+                if ai_data["distress_flag"] != "none":
+                    flag_history.append(ai_data["distress_flag"])
+                    if len(flag_history) > 5:
+                        flag_history.pop(0)
 
-            user_ref.set({
-                "user_id": request.user_id,
-                "mitram_state": {
-                    "current_color": ai_data["orb_color"],
-                    "core_vibe": ai_data["snappy_reaction"],
-                    "last_fed_timestamp": datetime.utcnow().isoformat() + "Z"
-                },
-                "recent_distress_flags": flag_history
-            }, merge=True)
-        except Exception as db_err:
-            print(f"Firestore logging error (non-fatal): {db_err}")
+                user_ref.set({
+                    "user_id": request.user_id,
+                    "mitram_state": {
+                        "current_color": ai_data["orb_color"],
+                        "core_vibe": ai_data["snappy_reaction"],
+                        "last_fed_timestamp": datetime.utcnow().isoformat() + "Z"
+                    },
+                    "recent_distress_flags": flag_history
+                }, merge=True)
+                db_status = "✓ Sync successful"
+            except Exception as db_err:
+                db_status = f"✗ Firestore operational failure: {str(db_err)}"
+                print(f"Firestore Write Error: {str(db_err)}")
+        else:
+            db_status = "✗ Firestore skipped: Client initialization failed at startup."
 
+        # Append the database debug status directly to the response payload
+        ai_data["db_status"] = db_status
         return ai_data
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException as http_err:
+        raise http_err
+    except Exception as general_err:
+        raise HTTPException(status_code=500, detail=f"Internal Core Server Exception: {str(general_err)}")
