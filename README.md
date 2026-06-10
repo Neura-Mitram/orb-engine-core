@@ -4,14 +4,14 @@ Neura-Mitram Core Backend Engine
 
 This repository houses the lightweight, high-performance, serverless backend engine for Neura-Mitram (Your Neural Friend). 
 
-The application utilizes FastAPI to handle incoming asynchronous traffic and communicates natively with Google Gemini 1.5 Flash using the modern `google-genai` SDK. It is designed to run in a stateless, containerized sandbox on **Google Cloud Run**, automatically scaling down to zero when idle to achieve 100% cost efficiency.
+The application utilizes FastAPI to handle incoming asynchronous traffic and communicates natively with Open-Router using the modern `openrouter/free` SDK. It is designed to run in a stateless, containerized sandbox on **Google Cloud Run**, automatically scaling down to zero when idle to achieve 100% cost efficiency.
 
 ---
 
 🏗️ Technical Architecture
 
 * **API Framework:** FastAPI (Asynchronous Python Web Framework)
-* **AI Model Engine:** Gemini 1.5 Flash
+* **AI Model Engine:** openrouter/free
 * **Deployment System:** Docker container hosted on Google Cloud Run
 * **Database Sync:** Firebase Firestore
 
@@ -20,7 +20,7 @@ The application utilizes FastAPI to handle incoming asynchronous traffic and com
 📂 Repository File Matrix
 
 * `main.py` - Core routing logic, API endpoint declarations, and system prompts for the Gemini model.
-* `requirements.txt` - Python module dependencies mapping runtime packages (`fastapi`, `google-genai`, `uvicorn`, `pydantic`).
+* `requirements.txt` - Python module dependencies mapping runtime packages (`fastapi`, `openrouter/free`, `uvicorn`, `pydantic`).
 * `Dockerfile` - The step-by-step build recipe utilized by Google Cloud Build to compile the runtime Linux sandbox.
 
 ---
