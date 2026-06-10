@@ -69,7 +69,7 @@ async def feed_mitram(request: FeedRequest):
     )
 
     payload = {
-        "model": "google/gemini-2.5-flash:free",
+        "model": "openrouter/free",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": request.user_input}
