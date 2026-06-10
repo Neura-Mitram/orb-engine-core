@@ -10,23 +10,32 @@ import requests
 
 app = FastAPI(title="Neura-Mitram Core Engine - OpenRouter Edition")
 
-# Security: CORS configuration for your live domain
+# Security: Allow incoming traffic from your frontend layout
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://neuramitram.space", "https://www.neuramitram.space", "http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Database NATIVELY
-db = None
-try:
-    firebase_admin.initialize_app()
-    db = firestore.client()
-    print("✓ Firestore Native Client connected cleanly.")
-except Exception as e:
-    print(f"✗ Firebase failed to initialize: {e}")
+# Global database placeholder
+db_client = None
+
+def get_firestore_db():
+    """Initializes Firestore on-demand to prevent container startup timeouts."""
+    global db_client
+    if db_client is None:
+        try:
+            # Only initialize if Firebase hasn't been initialized yet
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app()
+            db_client = firestore.client()
+            print("✓ Firestore Native Client connected cleanly on-demand.")
+        except Exception as e:
+            print(f"✗ Lazy Firebase Initialization Failed: {str(e)}")
+            db_client = None
+    return db_client
 
 class FeedRequest(BaseModel):
     user_id: str
@@ -34,15 +43,14 @@ class FeedRequest(BaseModel):
 
 @app.get("/")
 def health_check():
+    # Blazing fast health check response with zero network dependencies
     return {
         "status": "online", 
-        "service": "Neura-Mitram OpenRouter Gateway",
-        "database_bound": db is not None
+        "service": "Neura-Mitram Instant-Boot Engine"
     }
 
 @app.post("/feed-mitram")
 async def feed_mitram(request: FeedRequest):
-    # Grab the OpenRouter key from your Cloud Run setup
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_key:
         raise HTTPException(status_code=500, detail="Backend configuration error: OPENROUTER_API_KEY environment variable is missing.")
@@ -60,7 +68,6 @@ async def feed_mitram(request: FeedRequest):
         "}"
     )
 
-    # Configure the payload for OpenRouter's free Gemini instance
     payload = {
         "model": "google/gemini-2.5-flash:free",
         "messages": [
@@ -87,7 +94,7 @@ async def feed_mitram(request: FeedRequest):
         )
         
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"OpenRouter returned an error: {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=f"OpenRouter error: {response.text}")
             
         response_data = response.json()
         raw_ai_text = response_data['choices'][0]['message']['content']
@@ -96,8 +103,10 @@ async def feed_mitram(request: FeedRequest):
     except Exception as api_err:
         raise HTTPException(status_code=502, detail=f"OpenRouter Engine Processing Failed: {str(api_err)}")
     
-    # Log Data Matrix to Firestore
+    # Resolve Firestore on-demand
+    db = get_firestore_db()
     db_status = "Not executed"
+    
     if db is not None:
         try:
             user_ref = db.collection("users").document(request.user_id)
@@ -126,7 +135,7 @@ async def feed_mitram(request: FeedRequest):
         except Exception as db_err:
             db_status = f"✗ Firestore operation failed: {str(db_err)}"
     else:
-        db_status = "✗ Firestore client uninitialized."
+        db_status = "✗ Firestore skipped: Failed to boot database driver on request hook."
 
     ai_data["db_status"] = db_status
     return ai_data
