@@ -4,17 +4,16 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
 import firebase_admin
 from firebase_admin import firestore
+import requests
 
-app = FastAPI(title="Neura-Mitram Core Engine")
+app = FastAPI(title="Neura-Mitram Core Engine - OpenRouter Edition")
 
-# Security: Broadened temporarily to ensure your Cloudflare domain connects cleanly during debugging
+# Security: CORS configuration for your live domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://neuramitram.space", "https://www.neuramitram.space", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,17 +24,9 @@ db = None
 try:
     firebase_admin.initialize_app()
     db = firestore.client()
-    print("✓ Firestore Native Client initialized successfully.")
+    print("✓ Firestore Native Client connected cleanly.")
 except Exception as e:
-    print(f"✗ Critical Firebase Init Error: {str(e)}")
-
-# Initialize AI Client
-client = None
-try:
-    client = genai.Client()
-    print("✓ Gemini client initialized successfully.")
-except Exception as e:
-    print(f"✗ Critical Gemini Init Error: {str(e)}")
+    print(f"✗ Firebase failed to initialize: {e}")
 
 class FeedRequest(BaseModel):
     user_id: str
@@ -45,89 +36,97 @@ class FeedRequest(BaseModel):
 def health_check():
     return {
         "status": "online", 
-        "service": "Neura-Mitram Debug Mode",
-        "database_bound": db is not None,
-        "gemini_bound": client is not None
+        "service": "Neura-Mitram OpenRouter Gateway",
+        "database_bound": db is not None
     }
 
 @app.post("/feed-mitram")
 async def feed_mitram(request: FeedRequest):
-    # Verify client states immediately before running code
-    if not client:
-        raise HTTPException(status_code=500, detail="Gemini client is offline or missing GEMINI_API_KEY environment variable.")
+    # Grab the OpenRouter key from your Cloud Run setup
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if not openrouter_key:
+        raise HTTPException(status_code=500, detail="Backend configuration error: OPENROUTER_API_KEY environment variable is missing.")
 
+    system_prompt = (
+        "You are Neura-Mitram, a sentient, psychological digital entity serving as a mirror "
+        "to the user's subconscious. Analyze their input and return a precise JSON response. "
+        "The response must strictly follow this JSON structure without any markdown formatting wrappers:\n"
+        "{\n"
+        "  \"orb_color\": \"crimson\" or \"grey\" or \"blue\" or \"gold\",\n"
+        "  \"snappy_reaction\": \"1-sentence witty psychological reaction\",\n"
+        "  \"deep_analysis\": \"Profound 3-sentence root-cause analysis\",\n"
+        "  \"distress_flag\": \"none\" or \"insomnia\" or \"relationship_toxicity\" or \"burnout\" or \"general_anxiety\",\n"
+        "  \"health_impact\": integer between -10 and 10\n"
+        "}"
+    )
+
+    # Configure the payload for OpenRouter's free Gemini instance
+    payload = {
+        "model": "google/gemini-2.5-flash:free",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.user_input}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+
+    headers = {
+        "Authorization": f"Bearer {openrouter_key}",
+        "HTTP-Referer": "https://neuramitram.space",
+        "X-Title": "Neura-Mitram",
+        "Content-Type": "application/json"
+    }
+
+    # Dispatch Request to OpenRouter API
     try:
-        system_prompt = (
-            "You are Neura-Mitram, a sentient, psychological digital entity serving as a mirror "
-            "to the user's subconscious. Analyze their input and return a precise JSON response."
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=10
         )
-
-        response_schema = {
-            "type": "OBJECT",
-            "properties": {
-                "orb_color": {"type": "STRING", "description": "Must be: 'crimson', 'grey', 'blue', or 'gold'."},
-                "snappy_reaction": {"type": "STRING", "description": "A 1-sentence witty psychological reaction."},
-                "deep_analysis": {"type": "STRING", "description": "A profound 3-sentence root-cause analysis."},
-                "distress_flag": {"type": "STRING", "description": "Must be: 'none', 'insomnia', 'relationship_toxicity', 'burnout', 'general_anxiety'."},
-                "health_impact": {"type": "INTEGER", "description": "Integer between -10 and 10."}
-            },
-            "required": ["orb_color", "snappy_reaction", "deep_analysis", "distress_flag", "health_impact"]
-        }
-
-        # Request response from Gemini
-        try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=request.user_input,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
-                    temperature=0.7
-                )
-            )
-            ai_data = json.loads(response.text)
-        except Exception as ai_err:
-            raise HTTPException(status_code=502, detail=f"Gemini API Processing Failed: {str(ai_err)}")
         
-        # Log to Firestore with explicit internal error handling
-        db_status = "Not executed"
-        if db is not None:
-            try:
-                user_ref = db.collection("users").document(request.user_id)
-                user_doc = user_ref.get()
-                flag_history = []
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=f"OpenRouter returned an error: {response.text}")
+            
+        response_data = response.json()
+        raw_ai_text = response_data['choices'][0]['message']['content']
+        ai_data = json.loads(raw_ai_text)
+        
+    except Exception as api_err:
+        raise HTTPException(status_code=502, detail=f"OpenRouter Engine Processing Failed: {str(api_err)}")
+    
+    # Log Data Matrix to Firestore
+    db_status = "Not executed"
+    if db is not None:
+        try:
+            user_ref = db.collection("users").document(request.user_id)
+            user_doc = user_ref.get()
+            flag_history = []
+            
+            if user_doc.exists:
+                existing_data = user_doc.to_dict()
+                flag_history = existing_data.get("recent_distress_flags", [])
                 
-                if user_doc.exists:
-                    existing_data = user_doc.to_dict()
-                    flag_history = existing_data.get("recent_distress_flags", [])
-                    
-                if ai_data["distress_flag"] != "none":
-                    flag_history.append(ai_data["distress_flag"])
-                    if len(flag_history) > 5:
-                        flag_history.pop(0)
+            if ai_data.get("distress_flag") and ai_data["distress_flag"] != "none":
+                flag_history.append(ai_data["distress_flag"])
+                if len(flag_history) > 5:
+                    flag_history.pop(0)
 
-                user_ref.set({
-                    "user_id": request.user_id,
-                    "mitram_state": {
-                        "current_color": ai_data["orb_color"],
-                        "core_vibe": ai_data["snappy_reaction"],
-                        "last_fed_timestamp": datetime.utcnow().isoformat() + "Z"
-                    },
-                    "recent_distress_flags": flag_history
-                }, merge=True)
-                db_status = "✓ Sync successful"
-            except Exception as db_err:
-                db_status = f"✗ Firestore operational failure: {str(db_err)}"
-                print(f"Firestore Write Error: {str(db_err)}")
-        else:
-            db_status = "✗ Firestore skipped: Client initialization failed at startup."
+            user_ref.set({
+                "user_id": request.user_id,
+                "mitram_state": {
+                    "current_color": ai_data.get("orb_color", "gold"),
+                    "core_vibe": ai_data.get("snappy_reaction", "Synchronized"),
+                    "last_fed_timestamp": datetime.utcnow().isoformat() + "Z"
+                },
+                "recent_distress_flags": flag_history
+            }, merge=True)
+            db_status = "✓ Sync successful"
+        except Exception as db_err:
+            db_status = f"✗ Firestore operation failed: {str(db_err)}"
+    else:
+        db_status = "✗ Firestore client uninitialized."
 
-        # Append the database debug status directly to the response payload
-        ai_data["db_status"] = db_status
-        return ai_data
-
-    except HTTPException as http_err:
-        raise http_err
-    except Exception as general_err:
-        raise HTTPException(status_code=500, detail=f"Internal Core Server Exception: {str(general_err)}")
+    ai_data["db_status"] = db_status
+    return ai_data
