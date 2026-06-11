@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,9 +8,8 @@ import firebase_admin
 from firebase_admin import firestore
 import requests
 
-app = FastAPI(title="Neura-Mitram Core Engine - OpenRouter Edition")
+app = FastAPI(title="Neura-Mitram Core Engine - Sentient Loop")
 
-# Security: Allow incoming traffic from your frontend layout
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,15 +18,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global database placeholder
 db_client = None
 
 def get_firestore_db():
-    """Initializes Firestore on-demand to prevent container startup timeouts."""
     global db_client
     if db_client is None:
         try:
-            # Only initialize if Firebase hasn't been initialized yet
             if not firebase_admin._apps:
                 firebase_admin.initialize_app()
             db_client = firestore.client()
@@ -41,21 +37,84 @@ class FeedRequest(BaseModel):
     user_id: str
     user_input: str
 
+class WakeRequest(BaseModel):
+    user_id: str
+
 @app.get("/")
 def health_check():
-    # Blazing fast health check response with zero network dependencies
+    return {"status": "online", "service": "Neura-Mitram Instant-Boot Engine"}
+
+@app.post("/wake-mitram")
+async def wake_mitram(request: WakeRequest):
+    """Fires on page load to check cognitive decay and deliver a daily directive."""
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if not openrouter_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY missing.")
+
+    db = get_firestore_db()
+    flag_history = []
+    decay_state = False
+    
+    if db is not None:
+        try:
+            user_ref = db.collection("users").document(request.user_id)
+            user_doc = user_ref.get()
+            if user_doc.exists:
+                data = user_doc.to_dict()
+                flag_history = data.get("recent_distress_flags", [])
+                
+                # Check for cognitive decay (48 hours)
+                last_fed_str = data.get("mitram_state", {}).get("last_fed_timestamp")
+                if last_fed_str:
+                    last_fed = datetime.fromisoformat(last_fed_str.replace('Z', '+00:00'))
+                    hours_since = (datetime.now(timezone.utc) - last_fed).total_seconds() / 3600
+                    if hours_since > 48:
+                        decay_state = True
+        except Exception as e:
+            print(f"Wake Fetch Failed: {e}")
+
+    # Generate the Daily Directive
+    if not flag_history:
+        directive = "SYSTEM AWAKE. WAITING FOR INITIAL NEURAL CALIBRATION."
+    else:
+        history_str = ", ".join(flag_history)
+        system_prompt = (
+            "You are a brutal, Cyberpunk psychological AI. The user just opened their terminal. "
+            f"Their recent psychological history is: [{history_str}]. "
+            "Give them a sharp, 1-line, cryptic but deeply accurate morning directive. "
+            "Do not sugarcoat it. Output strict JSON:\n"
+            "{ \"directive\": \"your 1-line message here\" }"
+        )
+        
+        payload = {
+            "model": "openrouter/free",
+            "messages": [{"role": "system", "content": system_prompt}],
+            "response_format": {"type": "json_object"}
+        }
+        
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=15
+            )
+            ai_data = json.loads(response.json()['choices'][0]['message']['content'])
+            directive = ai_data.get("directive", "SYSTEM AWAKE. AWAITING INPUT.")
+        except Exception:
+            directive = "CONNECTION UNSTABLE. AWAITING RAW INPUT TO CALIBRATE."
+
     return {
-        "status": "online", 
-        "service": "Neura-Mitram Instant-Boot Engine"
+        "directive": directive.upper(),
+        "decay_state": decay_state
     }
 
 @app.post("/feed-mitram")
 async def feed_mitram(request: FeedRequest):
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_key:
-        raise HTTPException(status_code=500, detail="Backend configuration error: OPENROUTER_API_KEY environment variable is missing.")
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is missing.")
 
-    # 1. READ MEMORY CORE (Fetch history before talking to AI)
     db = get_firestore_db()
     flag_history = []
     if db is not None:
@@ -67,15 +126,13 @@ async def feed_mitram(request: FeedRequest):
         except Exception as e:
             print(f"Memory Fetch Failed: {e}")
 
-    # 2. INJECT MEMORY INTO AI PROMPT
     memory_context = ""
     if len(flag_history) > 0:
         history_str = ", ".join(flag_history)
-        memory_context = f"\n\nCRITICAL CONTEXT: The user's recent psychological states over past sessions were: [{history_str}]. Acknowledge this ongoing trend subtly in your deep_analysis if relevant."
+        memory_context = f"\n\nCRITICAL CONTEXT: The user's recent psychological states: [{history_str}]. Acknowledge this ongoing trend."
 
     system_prompt = (
-        "You are Neura-Mitram, a sentient, psychological digital entity serving as a mirror "
-        "to the user's subconscious. Analyze their input and return a precise JSON response. "
+        "You are Neura-Mitram, a sentient, psychological digital entity. "
         "The response must strictly follow this JSON structure without any markdown formatting wrappers:\n"
         "{\n"
         "  \"orb_color\": \"crimson\" or \"grey\" or \"blue\" or \"gold\",\n"
@@ -97,32 +154,23 @@ async def feed_mitram(request: FeedRequest):
 
     headers = {
         "Authorization": f"Bearer {openrouter_key}",
-        "HTTP-Referer": "https://neuramitram.space",
-        "X-Title": "Neura-Mitram",
         "Content-Type": "application/json"
     }
 
-    # 3. DISPATCH TO OPENROUTER API
     try:
-        # Increased timeout to 30s because free models can sometimes be slow to wake up
         response = requests.post(
             url="https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             data=json.dumps(payload),
             timeout=30
         )
-        
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"OpenRouter error: {response.text}")
+            raise HTTPException(status_code=response.status_code, detail="OpenRouter error")
             
-        response_data = response.json()
-        raw_ai_text = response_data['choices'][0]['message']['content']
-        ai_data = json.loads(raw_ai_text)
-        
+        ai_data = json.loads(response.json()['choices'][0]['message']['content'])
     except Exception as api_err:
-        raise HTTPException(status_code=502, detail=f"OpenRouter Engine Processing Failed: {str(api_err)}")
+        raise HTTPException(status_code=502, detail=f"Engine Processing Failed: {str(api_err)}")
     
-    # 4. WRITE NEW STATE TO DATABASE
     db_status = "Not executed"
     if db is not None:
         try:
@@ -137,15 +185,14 @@ async def feed_mitram(request: FeedRequest):
                 "mitram_state": {
                     "current_color": ai_data.get("orb_color", "gold"),
                     "core_vibe": ai_data.get("snappy_reaction", "Synchronized"),
-                    "last_fed_timestamp": datetime.utcnow().isoformat() + "Z"
+                    # Using UTC string ending in Z for standard parsing
+                    "last_fed_timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                 },
                 "recent_distress_flags": flag_history
             }, merge=True)
             db_status = "✓ Sync successful"
         except Exception as db_err:
             db_status = f"✗ Firestore operation failed: {str(db_err)}"
-    else:
-        db_status = "✗ Firestore skipped: Failed to boot database driver on request hook."
 
     ai_data["db_status"] = db_status
     return ai_data
