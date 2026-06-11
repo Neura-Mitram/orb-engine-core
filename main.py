@@ -55,6 +55,24 @@ async def feed_mitram(request: FeedRequest):
     if not openrouter_key:
         raise HTTPException(status_code=500, detail="Backend configuration error: OPENROUTER_API_KEY environment variable is missing.")
 
+    # 1. READ MEMORY CORE (Fetch history before talking to AI)
+    db = get_firestore_db()
+    flag_history = []
+    if db is not None:
+        try:
+            user_ref = db.collection("users").document(request.user_id)
+            user_doc = user_ref.get()
+            if user_doc.exists:
+                flag_history = user_doc.to_dict().get("recent_distress_flags", [])
+        except Exception as e:
+            print(f"Memory Fetch Failed: {e}")
+
+    # 2. INJECT MEMORY INTO AI PROMPT
+    memory_context = ""
+    if len(flag_history) > 0:
+        history_str = ", ".join(flag_history)
+        memory_context = f"\n\nCRITICAL CONTEXT: The user's recent psychological states over past sessions were: [{history_str}]. Acknowledge this ongoing trend subtly in your deep_analysis if relevant."
+
     system_prompt = (
         "You are Neura-Mitram, a sentient, psychological digital entity serving as a mirror "
         "to the user's subconscious. Analyze their input and return a precise JSON response. "
@@ -66,7 +84,7 @@ async def feed_mitram(request: FeedRequest):
         "  \"distress_flag\": \"none\" or \"insomnia\" or \"relationship_toxicity\" or \"burnout\" or \"general_anxiety\",\n"
         "  \"health_impact\": integer between -10 and 10\n"
         "}"
-    )
+    ) + memory_context
 
     payload = {
         "model": "openrouter/free",
@@ -84,7 +102,7 @@ async def feed_mitram(request: FeedRequest):
         "Content-Type": "application/json"
     }
 
-    # Dispatch Request to OpenRouter API
+    # 3. DISPATCH TO OPENROUTER API
     try:
         # Increased timeout to 30s because free models can sometimes be slow to wake up
         response = requests.post(
@@ -104,25 +122,16 @@ async def feed_mitram(request: FeedRequest):
     except Exception as api_err:
         raise HTTPException(status_code=502, detail=f"OpenRouter Engine Processing Failed: {str(api_err)}")
     
-    # Resolve Firestore on-demand
-    db = get_firestore_db()
+    # 4. WRITE NEW STATE TO DATABASE
     db_status = "Not executed"
-    
     if db is not None:
         try:
-            user_ref = db.collection("users").document(request.user_id)
-            user_doc = user_ref.get()
-            flag_history = []
-            
-            if user_doc.exists:
-                existing_data = user_doc.to_dict()
-                flag_history = existing_data.get("recent_distress_flags", [])
-                
             if ai_data.get("distress_flag") and ai_data["distress_flag"] != "none":
                 flag_history.append(ai_data["distress_flag"])
                 if len(flag_history) > 5:
                     flag_history.pop(0)
 
+            user_ref = db.collection("users").document(request.user_id)
             user_ref.set({
                 "user_id": request.user_id,
                 "mitram_state": {
