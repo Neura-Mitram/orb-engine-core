@@ -1,198 +1,391 @@
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import firebase_admin
 from firebase_admin import firestore
-import requests
+import httpx
 
-app = FastAPI(title="Neura-Mitram Core Engine - Sentient Loop")
+# ─────────────────────────────────────────────
+#  APP INIT
+# ─────────────────────────────────────────────
+app = FastAPI(title="Neura-Mitram Core Engine v2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://neuramitram.space",
+        "https://www.neuramitram.space",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-db_client = None
+# ─────────────────────────────────────────────
+#  CONSTANTS
+# ─────────────────────────────────────────────
+PRIMARY_MODEL  = "openai/gpt-oss-120b:free"
+FALLBACK_MODEL = "google/gemma-4-31b-it:free"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-def get_firestore_db():
-    global db_client
-    if db_client is None:
+DISTRESS_FLAGS = (
+    "none|insomnia|relationship_toxicity|burnout|general_anxiety"
+    "|grief|loneliness|decision_paralysis|physical_exhaustion"
+    "|creative_block|financial_stress|identity_crisis"
+)
+RECOVERY_SIGNALS = (
+    "none|clarity|acceptance|motivation|emotional_release|breakthrough|gratitude"
+)
+
+# ─────────────────────────────────────────────
+#  FIRESTORE
+# ─────────────────────────────────────────────
+_db = None
+
+def get_db():
+    global _db
+    if _db is None:
         try:
             if not firebase_admin._apps:
                 firebase_admin.initialize_app()
-            db_client = firestore.client()
-            print("✓ Firestore Native Client connected cleanly on-demand.")
+            _db = firestore.client()
+            print("✓ Firestore connected.")
         except Exception as e:
-            print(f"✗ Lazy Firebase Initialization Failed: {str(e)}")
-            db_client = None
-    return db_client
+            print(f"✗ Firestore init failed: {e}")
+    return _db
 
+# ─────────────────────────────────────────────
+#  REQUEST MODELS
+# ─────────────────────────────────────────────
 class FeedRequest(BaseModel):
-    user_id: str
+    user_id:    str
     user_input: str
+
+    @validator("user_input")
+    def validate_input(cls, v):
+        v = v.strip()
+        if len(v) < 3:
+            raise ValueError("Input too short.")
+        if len(v) > 2000:
+            raise ValueError("Input too long (max 2000 chars).")
+        return v
 
 class WakeRequest(BaseModel):
     user_id: str
 
+class HistoryRequest(BaseModel):
+    user_id: str
+    limit:   int = 30
+
+# ─────────────────────────────────────────────
+#  OPENROUTER HELPER  (async + fallback)
+# ─────────────────────────────────────────────
+async def call_openrouter(key: str, system_prompt: str, user_message: str = "") -> dict:
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://neuramitram.space",
+        "X-Title":       "Neura-Mitram",
+    }
+    messages = [{"role": "system", "content": system_prompt}]
+    if user_message:
+        messages.append({"role": "user", "content": user_message})
+
+    payload = {
+        "model":           PRIMARY_MODEL,
+        "messages":        messages,
+        "response_format": {"type": "json_object"},
+        "temperature":     0.75,
+        "max_tokens":      600,
+    }
+
+    async with httpx.AsyncClient(timeout=35) as client:
+        r = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+
+        if r.status_code != 200:
+            # Fallback to secondary model
+            payload["model"] = FALLBACK_MODEL
+            r = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+            if r.status_code != 200:
+                raise HTTPException(502, f"Both AI models unavailable. Status: {r.status_code}")
+
+        raw = r.json()["choices"][0]["message"]["content"]
+        # Strip any accidental markdown fences
+        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(raw)
+
+# ─────────────────────────────────────────────
+#  ROUTES
+# ─────────────────────────────────────────────
+
 @app.get("/")
-def health_check():
-    return {"status": "online", "service": "Neura-Mitram Instant-Boot Engine"}
+def health():
+    return {
+        "status":        "online",
+        "version":       "2.0",
+        "primary_model": PRIMARY_MODEL,
+        "fallback":      FALLBACK_MODEL,
+    }
+
 
 @app.post("/wake-mitram")
 async def wake_mitram(request: WakeRequest):
-    """Fires on page load to check cognitive decay and deliver a daily directive."""
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-    if not openrouter_key:
-        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY missing.")
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise HTTPException(500, "OPENROUTER_API_KEY not set.")
 
-    db = get_firestore_db()
-    flag_history = []
-    decay_state = False
-    
-    if db is not None:
+    db = get_db()
+    flag_history   = []
+    decay_state    = False
+    decay_hours    = 0.0
+    session_streak = 0
+    dominant_flag  = None
+    escalation_mode = False
+
+    if db:
         try:
-            user_ref = db.collection("users").document(request.user_id)
-            user_doc = user_ref.get()
-            if user_doc.exists:
-                data = user_doc.to_dict()
-                flag_history = data.get("recent_distress_flags", [])
-                
-                # Check for cognitive decay (48 hours)
-                last_fed_str = data.get("mitram_state", {}).get("last_fed_timestamp")
-                if last_fed_str:
-                    last_fed = datetime.fromisoformat(last_fed_str.replace('Z', '+00:00'))
-                    hours_since = (datetime.now(timezone.utc) - last_fed).total_seconds() / 3600
-                    if hours_since > 48:
-                        decay_state = True
+            ref = db.collection("users").document(request.user_id)
+            doc = ref.get()
+
+            if doc.exists:
+                data           = doc.to_dict()
+                flag_history   = data.get("recent_distress_flags", [])
+                session_streak = data.get("session_streak", 0)
+                today          = date.today().isoformat()
+                yesterday      = (date.today() - timedelta(days=1)).isoformat()
+                last_date      = data.get("last_session_date", "")
+
+                # ── Streak tracking ──
+                if last_date == today:
+                    pass  # Already counted today
+                elif last_date == yesterday:
+                    session_streak += 1
+                    ref.set(
+                        {"session_streak": session_streak, "last_session_date": today},
+                        merge=True
+                    )
+                else:
+                    session_streak = 1
+                    ref.set(
+                        {"session_streak": 1, "last_session_date": today},
+                        merge=True
+                    )
+
+                # ── Cognitive decay ──
+                ts = data.get("mitram_state", {}).get("last_fed_timestamp")
+                if ts:
+                    last_fed    = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    decay_hours = (datetime.now(timezone.utc) - last_fed).total_seconds() / 3600
+                    if decay_hours > 168:
+                        decay_state = "death"
+                    elif decay_hours > 48:
+                        decay_state = "critical"
+                    elif decay_hours > 24:
+                        decay_state = "warning"
+
+            # ── Pattern detection ──
+            active = [f for f in flag_history if f != "none"]
+            if active:
+                dominant_flag = max(set(active), key=active.count)
+                if active.count(dominant_flag) >= 3:
+                    escalation_mode = True
+
         except Exception as e:
-            print(f"Wake Fetch Failed: {e}")
+            print(f"Wake fetch error: {e}")
 
-    # Generate the Daily Directive
-    if not flag_history:
-        directive = "SYSTEM AWAKE. WAITING FOR INITIAL NEURAL CALIBRATION."
-    else:
-        history_str = ", ".join(flag_history)
-        system_prompt = (
-            "You are a brutal, Cyberpunk psychological AI. The user just opened their terminal. "
-            f"Their recent psychological history is: [{history_str}]. "
-            "Give them a sharp, 1-line, cryptic but deeply accurate morning directive. "
-            "Do not sugarcoat it. Output strict JSON:\n"
-            "{ \"directive\": \"your 1-line message here\" }"
-        )
-        
-        payload = {
-            "model": "openrouter/free",
-            "messages": [{"role": "system", "content": system_prompt}],
-            "response_format": {"type": "json_object"}
-        }
-        
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {openrouter_key}", "Content-Type": "application/json"},
-                data=json.dumps(payload),
-                timeout=15
+    # ── Generate directive ──
+    directive = "SYSTEM AWAKE. WAITING FOR INITIAL NEURAL CALIBRATION."
+
+    if flag_history:
+        if escalation_mode and dominant_flag:
+            system_prompt = (
+                f"You are Mitram — the part of the user's mind they avoid. "
+                f"The user has flagged '{dominant_flag}' "
+                f"{flag_history.count(dominant_flag)}/{len(flag_history)} recent sessions. "
+                f"This is a chronic pattern, not a passing emotion. "
+                f"Give one razor-sharp directive addressing this pattern head-on. No comfort. No softening. "
+                f'Output ONLY this JSON: {{"directive": "your message here"}}'
             )
-            ai_data = json.loads(response.json()['choices'][0]['message']['content'])
-            directive = ai_data.get("directive", "SYSTEM AWAKE. AWAITING INPUT.")
-        except Exception:
-            directive = "CONNECTION UNSTABLE. AWAITING RAW INPUT TO CALIBRATE."
+        else:
+            history_str = ", ".join(flag_history)
+            system_prompt = (
+                f"You are Mitram — the part of the user's mind they avoid. "
+                f"Recent psychological states: [{history_str}]. "
+                f"Give one sharp 1-line morning directive. Name what they're carrying. No sugarcoating. "
+                f'Output ONLY this JSON: {{"directive": "your message here"}}'
+            )
+
+        try:
+            ai = await call_openrouter(key, system_prompt)
+            directive = ai.get("directive", directive)
+        except Exception as e:
+            print(f"Directive generation failed: {e}")
+            directive = "CONNECTION UNSTABLE. RAW INPUT REQUIRED TO CALIBRATE."
 
     return {
-        "directive": directive.upper(),
-        "decay_state": decay_state
+        "directive":        directive.upper(),
+        "decay_state":      decay_state,
+        "decay_hours":      round(decay_hours, 1),
+        "session_streak":   session_streak,
+        "dominant_flag":    dominant_flag,
+        "escalation_mode":  escalation_mode,
     }
+
 
 @app.post("/feed-mitram")
 async def feed_mitram(request: FeedRequest):
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-    if not openrouter_key:
-        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is missing.")
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise HTTPException(500, "OPENROUTER_API_KEY not set.")
 
-    db = get_firestore_db()
-    flag_history = []
-    if db is not None:
+    db = get_db()
+    flag_history     = []
+    recovery_history = []
+
+    if db:
         try:
-            user_ref = db.collection("users").document(request.user_id)
-            user_doc = user_ref.get()
-            if user_doc.exists:
-                flag_history = user_doc.to_dict().get("recent_distress_flags", [])
+            doc = db.collection("users").document(request.user_id).get()
+            if doc.exists:
+                d                = doc.to_dict()
+                flag_history     = d.get("recent_distress_flags", [])
+                recovery_history = d.get("recent_recovery_signals", [])
         except Exception as e:
-            print(f"Memory Fetch Failed: {e}")
+            print(f"Feed memory fetch error: {e}")
 
-    memory_context = ""
-    if len(flag_history) > 0:
-        history_str = ", ".join(flag_history)
-        memory_context = f"\n\nCRITICAL CONTEXT: The user's recent psychological states: [{history_str}]. Acknowledge this ongoing trend."
+    # Build memory context string
+    memory = ""
+    active = [f for f in flag_history if f != "none"]
+    if active:
+        memory += f"\n\nDISTRESS HISTORY (last sessions): [{', '.join(active)}]."
+        dominant = max(set(active), key=active.count)
+        if active.count(dominant) >= 3:
+            memory += f" PATTERN ALERT: '{dominant}' is now chronic. Name this explicitly in analysis."
+    rec = [r for r in recovery_history if r != "none"]
+    if rec:
+        memory += f"\nRECOVERY SIGNALS OBSERVED: [{', '.join(rec)}]. Acknowledge growth if visible."
 
     system_prompt = (
-        "You are Neura-Mitram, a sentient, psychological digital entity. "
-        "The response must strictly follow this JSON structure without any markdown formatting wrappers:\n"
+        "You are Mitram — not a therapist, not a bot. "
+        "You are the part of the user's mind that sees what they avoid. "
+        "Speak in short, percussive sentences. Name the real thing. No softening. No disclaimers.\n\n"
+        "Respond ONLY with this exact JSON object. No markdown, no extra keys, no explanation:\n"
         "{\n"
-        "  \"orb_color\": \"crimson\" or \"grey\" or \"blue\" or \"gold\",\n"
-        "  \"snappy_reaction\": \"1-sentence witty psychological reaction\",\n"
-        "  \"deep_analysis\": \"Profound 3-sentence root-cause analysis\",\n"
-        "  \"distress_flag\": \"none\" or \"insomnia\" or \"relationship_toxicity\" or \"burnout\" or \"general_anxiety\",\n"
-        "  \"health_impact\": integer between -10 and 10\n"
+        '  "orb_color": "crimson" or "grey" or "blue" or "gold",\n'
+        '  "snappy_reaction": "1 sentence — name the real thing bluntly",\n'
+        '  "deep_analysis": "exactly 3 sentences — root cause, underlying pattern, what they avoid",\n'
+        '  "suggested_action": "one specific micro-action doable in the next 2 hours",\n'
+        f'  "distress_flag": one of [{DISTRESS_FLAGS}],\n'
+        f'  "recovery_signal": one of [{RECOVERY_SIGNALS}],\n'
+        '  "urgency_level": integer 1 to 5,\n'
+        '  "health_impact": integer -10 to 10\n'
         "}"
-    ) + memory_context
+        + memory
+    )
 
-    payload = {
-        "model": "openrouter/free",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": request.user_input}
-        ],
-        "response_format": {"type": "json_object"}
-    }
+    ai_data = await call_openrouter(key, system_prompt, request.user_input)
 
-    headers = {
-        "Authorization": f"Bearer {openrouter_key}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=30
-        )
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="OpenRouter error")
-            
-        ai_data = json.loads(response.json()['choices'][0]['message']['content'])
-    except Exception as api_err:
-        raise HTTPException(status_code=502, detail=f"Engine Processing Failed: {str(api_err)}")
-    
-    db_status = "Not executed"
-    if db is not None:
+    # ── Persist to Firestore ──
+    db_status = "skipped"
+    if db:
         try:
-            if ai_data.get("distress_flag") and ai_data["distress_flag"] != "none":
-                flag_history.append(ai_data["distress_flag"])
+            distress = ai_data.get("distress_flag", "none")
+            recovery = ai_data.get("recovery_signal", "none")
+            now_ts   = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            if distress != "none":
+                flag_history.append(distress)
                 if len(flag_history) > 5:
                     flag_history.pop(0)
 
-            user_ref = db.collection("users").document(request.user_id)
-            user_ref.set({
+            if recovery != "none":
+                recovery_history.append(recovery)
+                if len(recovery_history) > 5:
+                    recovery_history.pop(0)
+
+            ref = db.collection("users").document(request.user_id)
+            ref.set({
                 "user_id": request.user_id,
                 "mitram_state": {
-                    "current_color": ai_data.get("orb_color", "gold"),
-                    "core_vibe": ai_data.get("snappy_reaction", "Synchronized"),
-                    # Using UTC string ending in Z for standard parsing
-                    "last_fed_timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+                    "current_color":      ai_data.get("orb_color", "gold"),
+                    "core_vibe":          ai_data.get("snappy_reaction", ""),
+                    "last_fed_timestamp": now_ts,
                 },
-                "recent_distress_flags": flag_history
+                "recent_distress_flags":   flag_history,
+                "recent_recovery_signals": recovery_history,
             }, merge=True)
-            db_status = "✓ Sync successful"
-        except Exception as db_err:
-            db_status = f"✗ Firestore operation failed: {str(db_err)}"
+
+            # Write to mood_history subcollection (powers the timeline chart)
+            ref.collection("mood_history").add({
+                "timestamp":       now_ts,
+                "orb_color":       ai_data.get("orb_color"),
+                "health_impact":   ai_data.get("health_impact"),
+                "urgency_level":   ai_data.get("urgency_level"),
+                "distress_flag":   distress,
+                "recovery_signal": recovery,
+            })
+
+            db_status = "synced"
+
+        except Exception as e:
+            db_status = f"error: {e}"
+            print(f"Firestore write error: {e}")
 
     ai_data["db_status"] = db_status
     return ai_data
+
+
+@app.post("/get-history")
+async def get_history(request: HistoryRequest):
+    db = get_db()
+    if not db:
+        raise HTTPException(503, "Database unavailable.")
+    try:
+        docs = (
+            db.collection("users")
+              .document(request.user_id)
+              .collection("mood_history")
+              .order_by("timestamp", direction=firestore.Query.DESCENDING)
+              .limit(min(request.limit, 90))
+              .stream()
+        )
+        entries = [d.to_dict() for d in docs]
+        entries.reverse()  # chronological for chart
+        return {"history": entries, "count": len(entries)}
+    except Exception as e:
+        raise HTTPException(500, f"History fetch failed: {e}")
+
+
+@app.post("/mirror-session")
+async def mirror_session(request: WakeRequest):
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise HTTPException(500, "OPENROUTER_API_KEY not set.")
+
+    db = get_db()
+    flag_history = []
+    if db:
+        try:
+            doc = db.collection("users").document(request.user_id).get()
+            if doc.exists:
+                flag_history = doc.to_dict().get("recent_distress_flags", [])
+        except Exception as e:
+            print(f"Mirror fetch error: {e}")
+
+    context = f"Recent states: [{', '.join(flag_history)}]." if flag_history else "New user — no history."
+
+    system_prompt = (
+        "You are Mitram in mirror mode. You ask, not analyze. "
+        f"{context} "
+        "Generate exactly 3 pointed psychological questions that expose what the user is avoiding. "
+        "Each question should be uncomfortable to deflect. Short and direct. "
+        'Output ONLY this JSON: {"questions": ["question 1", "question 2", "question 3"]}'
+    )
+
+    try:
+        ai = await call_openrouter(key, system_prompt)
+        return {"questions": ai.get("questions", [])}
+    except Exception as e:
+        raise HTTPException(502, f"Mirror session failed: {e}")
