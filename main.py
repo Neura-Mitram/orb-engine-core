@@ -1,7 +1,11 @@
 import os
 import json
+import hmac
+import hashlib
+import uuid
+import random
 from datetime import datetime, timezone, date, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 import firebase_admin
@@ -11,7 +15,7 @@ import httpx
 # ─────────────────────────────────────────────
 #  APP INIT
 # ─────────────────────────────────────────────
-app = FastAPI(title="Neura-Mitram Core Engine v2.0")
+app = FastAPI(title="Neura-Mitram Core Engine v2.1 — Phase 5 Mind-Key Economy")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +34,10 @@ app.add_middleware(
 PRIMARY_MODEL  = "openai/gpt-oss-120b:free"
 FALLBACK_MODEL = "google/gemma-4-31b-it:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+RAZORPAY_ORDERS_URL = "https://api.razorpay.com/v1/orders"
+DECRYPT_PRICE_PAISE = 4900  # ₹49.00 — change this single line to reprice
+CIPHER_CHARS = "ABCDEF0123456789#$%&@*XQZ"
 
 DISTRESS_FLAGS = (
     "none|insomnia|relationship_toxicity|burnout|general_anxiety"
@@ -80,6 +88,17 @@ class HistoryRequest(BaseModel):
     user_id: str
     limit:   int = 30
 
+class CreateOrderRequest(BaseModel):
+    user_id:    str
+    reading_id: str
+
+class VerifyPaymentRequest(BaseModel):
+    user_id:              str
+    reading_id:            str
+    razorpay_order_id:     str
+    razorpay_payment_id:   str
+    razorpay_signature:    str
+
 # ─────────────────────────────────────────────
 #  OPENROUTER HELPER  (async + fallback)
 # ─────────────────────────────────────────────
@@ -117,6 +136,40 @@ async def call_openrouter(key: str, system_prompt: str, user_message: str = "") 
         raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         return json.loads(raw)
 
+
+# ─────────────────────────────────────────────
+#  PHASE 5 HELPERS — Mind-Key Economy
+# ─────────────────────────────────────────────
+def scramble_text(text: str) -> str:
+    """
+    Produces a same-shape 'ciphertext' preview of locked text —
+    preserves spacing/punctuation/length so the blurred UI looks
+    like real encrypted output, without ever exposing real content.
+    """
+    return "".join(
+        random.choice(CIPHER_CHARS) if c.isalnum() else c
+        for c in text
+    )
+
+
+async def create_razorpay_order(key_id: str, key_secret: str, reading_id: str, user_id: str) -> dict:
+    payload = {
+        "amount":          DECRYPT_PRICE_PAISE,
+        "currency":        "INR",
+        "receipt":         reading_id,
+        "payment_capture": 1,
+        "notes": {
+            "user_id":    user_id,
+            "reading_id": reading_id,
+            "product":    "neura_mitram_diagnostic_decrypt",
+        },
+    }
+    async with httpx.AsyncClient(timeout=15, auth=(key_id, key_secret)) as client:
+        r = await client.post(RAZORPAY_ORDERS_URL, json=payload)
+        if r.status_code not in (200, 201):
+            raise HTTPException(502, f"Razorpay order creation failed: {r.text}")
+        return r.json()
+
 # ─────────────────────────────────────────────
 #  ROUTES
 # ─────────────────────────────────────────────
@@ -125,7 +178,7 @@ async def call_openrouter(key: str, system_prompt: str, user_message: str = "") 
 def health():
     return {
         "status":        "online",
-        "version":       "2.0",
+        "version":       "2.1",
         "primary_model": PRIMARY_MODEL,
         "fallback":      FALLBACK_MODEL,
     }
@@ -287,6 +340,10 @@ async def feed_mitram(request: FeedRequest):
 
     ai_data = await call_openrouter(key, system_prompt, request.user_input)
 
+    # ── PHASE 5: lock the deep diagnostic behind the Mind-Key paywall ──
+    reading_id   = uuid.uuid4().hex[:12]
+    real_deep    = ai_data.pop("deep_analysis", "")
+
     # ── Persist to Firestore ──
     db_status = "skipped"
     if db:
@@ -327,11 +384,32 @@ async def feed_mitram(request: FeedRequest):
                 "recovery_signal": recovery,
             })
 
+            # Store the real diagnostic server-side only — never sent until paid
+            ref.collection("locked_readings").document(reading_id).set({
+                "deep_analysis":  real_deep,
+                "paid":           False,
+                "created_at":     now_ts,
+                "amount_paise":   DECRYPT_PRICE_PAISE,
+                "razorpay_order_id": None,
+            })
+
             db_status = "synced"
 
         except Exception as e:
             db_status = f"error: {e}"
             print(f"Firestore write error: {e}")
+
+    if db and db_status == "synced":
+        # Locked path — only a scrambled, same-shape preview goes to the client
+        ai_data["reading_id"]            = reading_id
+        ai_data["deep_analysis_locked"]  = True
+        ai_data["deep_analysis_preview"] = scramble_text(real_deep)
+        ai_data["price_rupees"]          = DECRYPT_PRICE_PAISE // 100
+    else:
+        # No DB available to track payment — fail open, don't block the product
+        ai_data["reading_id"]           = reading_id
+        ai_data["deep_analysis_locked"] = False
+        ai_data["deep_analysis"]        = real_deep
 
     ai_data["db_status"] = db_status
     return ai_data
@@ -389,3 +467,130 @@ async def mirror_session(request: WakeRequest):
         return {"questions": ai.get("questions", [])}
     except Exception as e:
         raise HTTPException(502, f"Mirror session failed: {e}")
+
+
+# ─────────────────────────────────────────────
+#  PHASE 5 — THE MIND-KEY ECONOMY
+# ─────────────────────────────────────────────
+
+@app.post("/create-order")
+async def create_order(request: CreateOrderRequest):
+    key_id     = os.environ.get("RAZORPAY_KEY_ID")
+    key_secret = os.environ.get("RAZORPAY_KEY_SECRET")
+    if not key_id or not key_secret:
+        raise HTTPException(500, "Razorpay keys not configured.")
+
+    db = get_db()
+    if not db:
+        raise HTTPException(503, "Database unavailable — cannot process payment.")
+
+    ref = (
+        db.collection("users").document(request.user_id)
+          .collection("locked_readings").document(request.reading_id)
+    )
+    doc = ref.get()
+    if not doc.exists:
+        raise HTTPException(404, "Reading not found.")
+
+    data = doc.to_dict()
+    if data.get("paid"):
+        raise HTTPException(400, "This reading is already decrypted.")
+
+    order = await create_razorpay_order(key_id, key_secret, request.reading_id, request.user_id)
+
+    ref.set({"razorpay_order_id": order["id"]}, merge=True)
+
+    return {
+        "order_id": order["id"],
+        "amount":   order["amount"],
+        "currency": order["currency"],
+        "key_id":   key_id,  # publishable key — safe to expose to frontend
+    }
+
+
+@app.post("/verify-payment")
+async def verify_payment(request: VerifyPaymentRequest):
+    key_secret = os.environ.get("RAZORPAY_KEY_SECRET")
+    if not key_secret:
+        raise HTTPException(500, "Razorpay keys not configured.")
+
+    db = get_db()
+    if not db:
+        raise HTTPException(503, "Database unavailable — cannot verify payment.")
+
+    # ── Verify the HMAC signature Razorpay's checkout returned ──
+    payload_str = f"{request.razorpay_order_id}|{request.razorpay_payment_id}"
+    expected_sig = hmac.new(
+        key_secret.encode(), payload_str.encode(), hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_sig, request.razorpay_signature):
+        raise HTTPException(400, "Payment verification failed — signature mismatch.")
+
+    ref = (
+        db.collection("users").document(request.user_id)
+          .collection("locked_readings").document(request.reading_id)
+    )
+    doc = ref.get()
+    if not doc.exists:
+        raise HTTPException(404, "Reading not found.")
+
+    data = doc.to_dict()
+
+    # Defend against order substitution — the order on this reading must match
+    if data.get("razorpay_order_id") != request.razorpay_order_id:
+        raise HTTPException(400, "Order mismatch for this reading.")
+
+    if not data.get("paid"):
+        ref.set({
+            "paid":               True,
+            "razorpay_payment_id": request.razorpay_payment_id,
+            "paid_at":             datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }, merge=True)
+
+    return {
+        "success":      True,
+        "deep_analysis": data.get("deep_analysis", ""),
+    }
+
+
+@app.post("/razorpay-webhook")
+async def razorpay_webhook(request: Request):
+    """
+    Safety net for production: if a user closes the browser right after
+    paying but before /verify-payment fires, this webhook still marks the
+    reading as paid using Razorpay's server-to-server event instead of
+    relying solely on the client.
+    Configure this URL + secret in the Razorpay Dashboard → Webhooks.
+    """
+    webhook_secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
+    if not webhook_secret:
+        raise HTTPException(500, "Webhook secret not configured.")
+
+    body      = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+
+    expected_sig = hmac.new(webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, signature):
+        raise HTTPException(400, "Invalid webhook signature.")
+
+    event = json.loads(body)
+    if event.get("event") == "payment.captured":
+        payload = event["payload"]["payment"]["entity"]
+        notes   = payload.get("notes", {})
+        user_id    = notes.get("user_id")
+        reading_id = notes.get("reading_id")
+
+        db = get_db()
+        if db and user_id and reading_id:
+            ref = (
+                db.collection("users").document(user_id)
+                  .collection("locked_readings").document(reading_id)
+            )
+            ref.set({
+                "paid":               True,
+                "razorpay_payment_id": payload.get("id"),
+                "paid_via":            "webhook",
+            }, merge=True)
+
+    return {"status": "ok"}
